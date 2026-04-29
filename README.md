@@ -39,7 +39,7 @@ The script will **auto-install** these on Arch/CachyOS, Debian/Ubuntu, and Fedor
 ## Installation
 
 ```bash
-git clone https://github.com/danypetit-be/uefi32-iso-patcher.git
+git clone https://github.com/Danux-Be/uefi32-iso-patcher.git
 cd uefi32-iso-patcher
 chmod +x uefi32-iso-patcher.sh
 ```
