@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+# Global so the EXIT trap can always access it
+WORKDIR=""
+
 # ── Colors ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -166,76 +169,32 @@ set prefix=($root)/boot/grub
 source ($root)/boot/grub/grub.cfg
 GRUBCFG
 
+    # Only pass modules that are actually present — the set varies across distros
+    local wanted=(
+        all_video boot btrfs cat chain configfile echo
+        efifwsetup efinet ext2 fat font gettext
+        gfxmenu gfxterm gfxterm_background gzip halt help
+        hfsplus iso9660 jpeg keystatus linux linuxefi
+        lsefi lsefimmap lzma lzopio mdraid09 memdisk
+        minicmd normal ntfs part_apple part_gpt part_msdos
+        password_pbkdf2 png reboot regexp search
+        search_fs_file search_fs_uuid search_label serial
+        sleep squash4 tpm video xfs zstd
+    )
+    local modules=()
+    for m in "${wanted[@]}"; do
+        [[ -f "${module_dir}/${m}.mod" ]] && modules+=("$m")
+    done
+    info "Embedding ${#modules[@]} modules"
+
     info "Building bootia32.efi with grub-mkimage…"
     grub-mkimage \
-        --directory  "$module_dir" \
-        --prefix     "/boot/grub" \
-        --output     "${workdir}/bootia32.efi" \
-        --format     i386-efi \
-        --config     "$grub_cfg" \
-        all_video \
-        boot \
-        btrfs \
-        cat \
-        chain \
-        configfile \
-        echo \
-        efifwsetup \
-        efinet \
-        ext2 \
-        fat \
-        font \
-        gettext \
-        gfxmenu \
-        gfxterm \
-        gfxterm_background \
-        gzip \
-        halt \
-        help \
-        hfsplus \
-        iso9660 \
-        jpeg \
-        keystatus \
-        linux \
-        linuxefi \
-        lsefi \
-        lsefimmap \
-        lzma \
-        lzopio \
-        mdraid09 \
-        memdisk \
-        minicmd \
-        normal \
-        ntfs \
-        part_apple \
-        part_gpt \
-        part_msdos \
-        password_pbkdf2 \
-        png \
-        reboot \
-        regexp \
-        search \
-        search_fs_file \
-        search_fs_uuid \
-        search_label \
-        serial \
-        sleep \
-        squash4 \
-        tpm \
-        video \
-        xfs \
-        zstd 2>/dev/null || \
-    grub-mkimage \
-        --directory  "$module_dir" \
-        --prefix     "/boot/grub" \
-        --output     "${workdir}/bootia32.efi" \
-        --format     i386-efi \
-        --config     "$grub_cfg" \
-        all_video boot btrfs cat chain configfile echo ext2 fat \
-        font gfxmenu gfxterm gzip halt help iso9660 jpeg linux \
-        lzma memdisk minicmd normal ntfs part_gpt part_msdos \
-        reboot regexp search search_fs_file search_fs_uuid \
-        search_label sleep video xfs
+        --directory "$module_dir" \
+        --prefix    "/boot/grub" \
+        --output    "${workdir}/bootia32.efi" \
+        --format    i386-efi \
+        --config    "$grub_cfg" \
+        "${modules[@]}"
 
     [[ -f "${workdir}/bootia32.efi" ]] || die "grub-mkimage failed to produce bootia32.efi"
     success "bootia32.efi built ($(du -sh "${workdir}/bootia32.efi" | cut -f1))."
@@ -317,18 +276,17 @@ main() {
     echo
 
     # Step 2 — working directory
-    local workdir
-    workdir=$(mktemp -d /tmp/uefi32-patcher.XXXXXX)
-    trap 'rm -rf "$workdir"' EXIT
-    info "Temp workdir: ${workdir}"
+    WORKDIR=$(mktemp -d /tmp/uefi32-patcher.XXXXXX)
+    trap '[[ -n "$WORKDIR" ]] && rm -rf "$WORKDIR"' EXIT
+    info "Temp workdir: ${WORKDIR}"
     echo
 
     # Step 3 — build EFI binary
-    build_bootia32 "$workdir"
+    build_bootia32 "$WORKDIR"
     echo
 
     # Step 4 — patch ISO
-    patch_iso "$input_iso" "$output_iso" "$workdir"
+    patch_iso "$input_iso" "$output_iso" "$WORKDIR"
     echo
 
     echo -e "${BOLD}${GREEN}Done!${NC} You can now write the patched ISO to a USB drive:"
