@@ -201,11 +201,31 @@ GRUBCFG
 }
 
 # ── Probe EFI image path inside the ISO ─────────────────────────────────────
+# Find a file in the ISO by name (case-insensitive) and print its unquoted path.
+# xorriso -find prints shell-quoted paths ('/EFI/boot/x' with ' as '"'"'), so unquote them.
+iso_find() {
+    local iso="$1" name="$2" pattern="" c i
+    for (( i = 0; i < ${#name}; i++ )); do
+        c="${name:i:1}"
+        if [[ "$c" == [[:alpha:]] ]]; then
+            pattern+="[${c,}${c^}]"
+        else
+            pattern+="$c"
+        fi
+    done
+    local path
+    path=$(xorriso -osirrox on -indev "$iso" -find / -name "$pattern" 2>/dev/null | head -1 || true)
+    [[ -n "$path" ]] || return 0
+    path="${path#\'}"
+    path="${path%\'}"
+    echo "${path//\'\"\'\"\'/\'}"
+}
+
 find_efi_path() {
     local iso="$1"
     # Look for an existing 64-bit EFI entry to mirror the path
     local path
-    path=$(xorriso -osirrox on -indev "$iso" -find / -name 'bootx64.efi' 2>/dev/null | head -1 || true)
+    path=$(iso_find "$iso" 'bootx64.efi')
     if [[ -n "$path" ]]; then
         dirname "$path"
     else
@@ -224,16 +244,20 @@ patch_iso() {
     efi_dir=$(find_efi_path "$input_iso")
     info "EFI directory inside ISO: ${efi_dir}"
 
-    # Check if bootia32.efi already exists
-    if xorriso -osirrox on -indev "$input_iso" -find / -name 'bootia32.efi' 2>/dev/null | grep -q .; then
-        warn "bootia32.efi already exists in the ISO. It will be replaced."
+    # Check if bootia32.efi already exists; if so, replace it in place
+    local target="${efi_dir}/bootia32.efi"
+    local existing
+    existing=$(iso_find "$input_iso" 'bootia32.efi')
+    if [[ -n "$existing" ]]; then
+        warn "bootia32.efi already exists in the ISO (${existing}). It will be replaced."
+        target="$existing"
     fi
 
     info "Injecting bootia32.efi into the ISO…"
     xorriso \
         -indev  "$input_iso" \
         -outdev "$output_iso" \
-        -map    "${workdir}/bootia32.efi" "${efi_dir}/bootia32.efi" \
+        -map    "${workdir}/bootia32.efi" "$target" \
         -boot_image any replay \
         2>&1 | grep -v '^xorriso : UPDATE' || true
 
