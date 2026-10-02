@@ -7,6 +7,21 @@ set -euo pipefail
 # Global so the EXIT trap can always access it
 WORKDIR=""
 
+# Possible locations of the grub i386-efi modules, depending on the distro
+GRUB_MODULE_DIRS=(
+    /usr/lib/grub/i386-efi
+    /usr/share/grub/i386-efi
+    /usr/lib/grub2/i386-efi
+    /usr/lib64/grub/i386-efi
+)
+
+# Candidate GRUB configs inside the ISO, in order of preference
+GRUB_CFG_CANDIDATES=(
+    /boot/grub/grub.cfg
+    /EFI/BOOT/grub.cfg
+    /boot/grub2/grub.cfg
+)
+
 # ── Colors ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -43,6 +58,23 @@ EOF
 }
 
 # ── Dependency helpers ───────────────────────────────────────────────────────
+# grub-mkimage is called grub2-mkimage on Fedora
+find_grub_mkimage() {
+    local cmd
+    for cmd in grub-mkimage grub2-mkimage; do
+        command -v "$cmd" &>/dev/null && { echo "$cmd"; return; }
+    done
+    return 0
+}
+
+find_grub_modules() {
+    local d
+    for d in "${GRUB_MODULE_DIRS[@]}"; do
+        [[ -d "$d" ]] && { echo "$d"; return; }
+    done
+    return 0
+}
+
 detect_distro() {
     if command -v pacman &>/dev/null; then
         echo "arch"
@@ -60,22 +92,25 @@ install_deps() {
     distro=$(detect_distro)
     info "Detected package manager: ${distro}"
 
+    # grub-mkimage alone is not enough: the i386-efi modules are often a separate package
+    local need_grub=false
+    [[ -n "$(find_grub_mkimage)" && -n "$(find_grub_modules)" ]] || need_grub=true
+
+    local pkgs=()
     case "$distro" in
         arch)
-            local pkgs=()
-            command -v grub-mkimage &>/dev/null || pkgs+=(grub)
-            command -v xorriso      &>/dev/null || pkgs+=(xorriso)
-            command -v mformat      &>/dev/null || pkgs+=(mtools)
+            $need_grub                     && pkgs+=(grub)
+            command -v xorriso &>/dev/null || pkgs+=(xorriso)
+            command -v mformat &>/dev/null || pkgs+=(mtools)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
                 info "Installing: ${pkgs[*]}"
-                sudo pacman -Sy --noconfirm "${pkgs[@]}"
+                sudo pacman -S --needed --noconfirm "${pkgs[@]}"
             fi
             ;;
         debian)
-            local pkgs=()
-            command -v grub-mkimage &>/dev/null || pkgs+=(grub-efi-ia32-bin)
-            command -v xorriso      &>/dev/null || pkgs+=(xorriso)
-            command -v mformat      &>/dev/null || pkgs+=(mtools)
+            $need_grub                     && pkgs+=(grub-efi-ia32-bin)
+            command -v xorriso &>/dev/null || pkgs+=(xorriso)
+            command -v mformat &>/dev/null || pkgs+=(mtools)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
                 info "Installing: ${pkgs[*]}"
                 sudo apt-get update -qq
@@ -83,10 +118,9 @@ install_deps() {
             fi
             ;;
         fedora)
-            local pkgs=()
-            command -v grub-mkimage &>/dev/null || pkgs+=(grub2-efi-ia32-modules)
-            command -v xorriso      &>/dev/null || pkgs+=(xorriso)
-            command -v mformat      &>/dev/null || pkgs+=(mtools)
+            $need_grub                     && pkgs+=(grub2-tools grub2-efi-ia32-modules)
+            command -v xorriso &>/dev/null || pkgs+=(xorriso)
+            command -v mformat &>/dev/null || pkgs+=(mtools)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
                 info "Installing: ${pkgs[*]}"
                 sudo dnf install -y "${pkgs[@]}"
@@ -98,123 +132,52 @@ install_deps() {
     esac
 }
 
+# Prints the missing dependencies, one per line
+missing_deps() {
+    [[ -n "$(find_grub_mkimage)" ]] || echo "grub-mkimage"
+    [[ -n "$(find_grub_modules)" ]] || echo "grub-i386-efi-modules"
+    command -v xorriso &>/dev/null  || echo "xorriso"
+    command -v mformat &>/dev/null  || echo "mformat (mtools)"
+}
+
 check_deps() {
     info "Checking dependencies…"
-    local missing=()
+    local missing
+    missing=$(missing_deps)
 
-    for cmd in grub-mkimage xorriso mformat; do
-        if ! command -v "$cmd" &>/dev/null; then
-            missing+=("$cmd")
-        fi
-    done
-
-    # grub i386-efi modules
-    local grub_prefix
-    grub_prefix=$(dirname "$(command -v grub-mkimage 2>/dev/null || true)")
-    local module_dirs=(
-        /usr/lib/grub/i386-efi
-        /usr/share/grub/i386-efi
-        /usr/lib/grub2/i386-efi
-        /usr/lib64/grub/i386-efi
-    )
-    local found_modules=false
-    for d in "${module_dirs[@]}"; do
-        [[ -d "$d" ]] && { found_modules=true; break; }
-    done
-    $found_modules || missing+=("grub-i386-efi-modules")
-
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        warn "Missing: ${missing[*]}"
+    if [[ -n "$missing" ]]; then
+        warn "Missing: $(echo $missing)"
         info "Attempting automatic installation…"
         install_deps
-        # re-check after install
-        for cmd in grub-mkimage xorriso mformat; do
-            command -v "$cmd" &>/dev/null || die "'$cmd' still not found after install attempt."
-        done
-        found_modules=false
-        for d in "${module_dirs[@]}"; do
-            [[ -d "$d" ]] && { found_modules=true; break; }
-        done
-        $found_modules || die "grub i386-efi modules not found. Install grub-efi-ia32-bin (Debian) or grub (Arch)."
+        missing=$(missing_deps)
+        [[ -z "$missing" ]] || die "Still missing after install attempt: $(echo $missing). Install grub-efi-ia32-bin (Debian), grub (Arch) or grub2-efi-ia32-modules (Fedora)."
     fi
 
     success "All dependencies are present."
 }
 
-# ── Find grub i386-efi module directory ─────────────────────────────────────
-find_grub_modules() {
-    local dirs=(
-        /usr/lib/grub/i386-efi
-        /usr/share/grub/i386-efi
-        /usr/lib/grub2/i386-efi
-        /usr/lib64/grub/i386-efi
-    )
-    for d in "${dirs[@]}"; do
-        [[ -d "$d" ]] && { echo "$d"; return; }
-    done
-    die "Cannot locate grub i386-efi module directory."
-}
-
-# ── Build bootia32.efi ───────────────────────────────────────────────────────
-build_bootia32() {
-    local workdir="$1"
-    local module_dir
-    module_dir=$(find_grub_modules)
-    info "Using grub modules from: ${module_dir}"
-
-    local grub_cfg="${workdir}/grub-early.cfg"
-    cat > "$grub_cfg" <<'GRUBCFG'
-search --no-floppy --file --set=root /boot/grub/grub.cfg
-set prefix=($root)/boot/grub
-source ($root)/boot/grub/grub.cfg
-GRUBCFG
-
-    # Only pass modules that are actually present — the set varies across distros
-    local wanted=(
-        all_video boot btrfs cat chain configfile echo
-        efifwsetup efinet ext2 fat font gettext
-        gfxmenu gfxterm gfxterm_background gzip halt help
-        hfsplus iso9660 jpeg keystatus linux linuxefi
-        lsefi lsefimmap lzma lzopio mdraid09 memdisk
-        minicmd normal ntfs part_apple part_gpt part_msdos
-        password_pbkdf2 png reboot regexp search
-        search_fs_file search_fs_uuid search_label serial
-        sleep squash4 tpm video xfs zstd
-    )
-    local modules=()
-    for m in "${wanted[@]}"; do
-        [[ -f "${module_dir}/${m}.mod" ]] && modules+=("$m")
-    done
-    info "Embedding ${#modules[@]} modules"
-
-    info "Building bootia32.efi with grub-mkimage…"
-    grub-mkimage \
-        --directory "$module_dir" \
-        --prefix    "/boot/grub" \
-        --output    "${workdir}/bootia32.efi" \
-        --format    i386-efi \
-        --config    "$grub_cfg" \
-        "${modules[@]}"
-
-    [[ -f "${workdir}/bootia32.efi" ]] || die "grub-mkimage failed to produce bootia32.efi"
-    success "bootia32.efi built ($(du -sh "${workdir}/bootia32.efi" | cut -f1))."
-}
-
-# ── Probe EFI image path inside the ISO ─────────────────────────────────────
-# Find a file in the ISO by name (case-insensitive) and print its unquoted path.
-# xorriso -find prints shell-quoted paths ('/EFI/boot/x' with ' as '"'"'), so unquote them.
-iso_find() {
-    local iso="$1" name="$2" pattern="" c i
-    for (( i = 0; i < ${#name}; i++ )); do
-        c="${name:i:1}"
+# ── Probe the ISO contents ───────────────────────────────────────────────────
+# Turn a name or path into a case-insensitive xorriso -find pattern
+ci_pattern() {
+    local s="$1" pattern="" c i
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
         if [[ "$c" == [[:alpha:]] ]]; then
             pattern+="[${c,}${c^}]"
         else
             pattern+="$c"
         fi
     done
+    echo "$pattern"
+}
+
+# Find a file in the ISO (case-insensitive) and print its unquoted path.
+# Usage: iso_find <iso> -name|-wholename <name or path>
+# xorriso -find prints shell-quoted paths ('/EFI/boot/x' with ' as '"'"'), so unquote them.
+iso_find() {
+    local iso="$1" test="$2" name="$3"
     local path
-    path=$(xorriso -osirrox on -indev "$iso" -find / -name "$pattern" 2>/dev/null | head -1 || true)
+    path=$(xorriso -osirrox on -indev "$iso" -find / "$test" "$(ci_pattern "$name")" 2>/dev/null | head -1 || true)
     [[ -n "$path" ]] || return 0
     path="${path#\'}"
     path="${path%\'}"
@@ -225,7 +188,7 @@ find_efi_path() {
     local iso="$1"
     # Look for an existing 64-bit EFI entry to mirror the path
     local path
-    path=$(iso_find "$iso" 'bootx64.efi')
+    path=$(iso_find "$iso" -name 'bootx64.efi')
     if [[ -n "$path" ]]; then
         dirname "$path"
     else
@@ -234,34 +197,123 @@ find_efi_path() {
     fi
 }
 
+# Print the path of the GRUB config to chain-load (empty if none found)
+find_grub_cfg() {
+    local iso="$1" cfg path
+    for cfg in "${GRUB_CFG_CANDIDATES[@]}"; do
+        path=$(iso_find "$iso" -wholename "$cfg")
+        [[ -n "$path" ]] && { echo "$path"; return; }
+    done
+    return 0
+}
+
+# Escape a string for use inside double quotes in a grub script
+grub_quote() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//\$/\\\$}"
+    echo "\"$s\""
+}
+
+# ── Build bootia32.efi ───────────────────────────────────────────────────────
+# Usage: build_bootia32 <workdir> <grub.cfg path in ISO> <marker path in ISO>
+build_bootia32() {
+    local workdir="$1"
+    local iso_cfg="$2"
+    local marker="$3"
+    local module_dir mkimage
+    module_dir=$(find_grub_modules)
+    mkimage=$(find_grub_mkimage)
+    [[ -n "$module_dir" ]] || die "Cannot locate grub i386-efi module directory."
+    info "Using grub modules from: ${module_dir}"
+
+    # Locate the ISO by a marker file unique to this patched image, so we never pick up
+    # a grub.cfg from another disk (e.g. a Linux already installed on the internal eMMC).
+    # Fall back to searching for the config itself if the marker got lost (file-copy tools).
+    local grub_cfg="${workdir}/grub-early.cfg"
+    cat > "$grub_cfg" <<GRUBCFG
+set root=
+search --no-floppy --file --set=root $(grub_quote "$marker")
+if [ -z "\$root" ]; then
+    search --no-floppy --file --set=root $(grub_quote "$iso_cfg")
+fi
+set prefix=(\$root)$(grub_quote "$(dirname "$iso_cfg")")
+source (\$root)$(grub_quote "$iso_cfg")
+GRUBCFG
+
+    # Only pass modules that are actually present — the set varies across distros.
+    # Everything grub.cfg may need must be embedded: there is no i386-efi module
+    # directory on the ISO, so any insmod of a missing module fails.
+    local wanted=(
+        all_video boot btrfs cat chain configfile cpuid echo
+        efifwsetup efinet eval ext2 fat font gettext
+        gfxmenu gfxterm gfxterm_background gfxterm_menu gzip halt help
+        hfsplus iso9660 jpeg keystatus linux linuxefi loadenv loopback ls
+        lsefi lsefimmap lzma lzopio mdraid09 memdisk
+        minicmd normal ntfs part_apple part_gpt part_msdos
+        password_pbkdf2 play png probe reboot regexp search
+        search_fs_file search_fs_uuid search_label serial
+        sleep smbios squash4 test tpm tr true udf video xfs zstd
+    )
+    local modules=() m
+    for m in "${wanted[@]}"; do
+        [[ -f "${module_dir}/${m}.mod" ]] && modules+=("$m")
+    done
+    info "Embedding ${#modules[@]} modules"
+
+    info "Building bootia32.efi with ${mkimage}…"
+    "$mkimage" \
+        --directory "$module_dir" \
+        --prefix    "$(dirname "$iso_cfg")" \
+        --output    "${workdir}/bootia32.efi" \
+        --format    i386-efi \
+        --config    "$grub_cfg" \
+        "${modules[@]}"
+
+    [[ -f "${workdir}/bootia32.efi" ]] || die "grub-mkimage failed to produce bootia32.efi"
+    success "bootia32.efi built ($(du -sh "${workdir}/bootia32.efi" | cut -f1))."
+}
+
 # ── Inject bootia32.efi into the ISO ────────────────────────────────────────
+# Usage: patch_iso <input> <output> <workdir> <efi dir in ISO> <marker path in ISO>
 patch_iso() {
     local input_iso="$1"
     local output_iso="$2"
     local workdir="$3"
-
-    local efi_dir
-    efi_dir=$(find_efi_path "$input_iso")
-    info "EFI directory inside ISO: ${efi_dir}"
+    local efi_dir="$4"
+    local marker="$5"
 
     # Check if bootia32.efi already exists; if so, replace it in place
     local target="${efi_dir}/bootia32.efi"
     local existing
-    existing=$(iso_find "$input_iso" 'bootia32.efi')
+    existing=$(iso_find "$input_iso" -name 'bootia32.efi')
     if [[ -n "$existing" ]]; then
         warn "bootia32.efi already exists in the ISO (${existing}). It will be replaced."
         target="$existing"
     fi
 
+    echo "uefi32-iso-patcher marker — used by bootia32.efi to find this image" > "${workdir}/marker"
+
+    # Never leave a stale output around: it would hide a failed run
+    rm -f "$output_iso"
+
     info "Injecting bootia32.efi into the ISO…"
-    xorriso \
+    local log="${workdir}/xorriso.log"
+    if ! xorriso \
         -indev  "$input_iso" \
         -outdev "$output_iso" \
         -map    "${workdir}/bootia32.efi" "$target" \
+        -map    "${workdir}/marker" "$marker" \
         -boot_image any replay \
-        2>&1 | grep -v '^xorriso : UPDATE' || true
+        >"$log" 2>&1; then
+        grep -v '^xorriso : UPDATE' "$log" >&2 || true
+        rm -f "$output_iso"
+        die "xorriso failed to produce the output ISO."
+    fi
+    grep -v '^xorriso : UPDATE' "$log" || true
 
-    [[ -f "$output_iso" ]] || die "xorriso failed to produce output ISO."
+    [[ -s "$output_iso" ]] || die "xorriso failed to produce output ISO."
     success "Patched ISO written to: ${output_iso}"
     info "Size: $(du -sh "$output_iso" | cut -f1)"
 }
@@ -281,15 +333,19 @@ main() {
 
     # Validate input
     [[ -f "$input_iso" ]] || die "File not found: ${input_iso}"
-    file "$input_iso" | grep -qi "ISO 9660" || warn "File may not be a valid ISO 9660 image."
+    # ISO 9660 primary volume descriptor signature ("CD001" at offset 32769).
+    # Must be fatal: xorriso silently starts from a blank image on non-ISO input.
+    [[ "$(dd if="$input_iso" bs=1 skip=32769 count=5 2>/dev/null)" == "CD001" ]] \
+        || die "Not an ISO 9660 image: ${input_iso}"
 
     # Default output name
     if [[ -z "$output_iso" ]]; then
-        local base="${input_iso%.iso}"
+        local base="${input_iso%.[iI][sS][oO]}"
         output_iso="${base}-uefi32.iso"
     fi
 
-    [[ "$input_iso" == "$output_iso" ]] && die "Input and output paths must differ."
+    [[ "$(realpath -m "$input_iso")" == "$(realpath -m "$output_iso")" ]] \
+        && die "Input and output paths must differ."
 
     info "Input:  ${input_iso}"
     info "Output: ${output_iso}"
@@ -305,12 +361,27 @@ main() {
     info "Temp workdir: ${WORKDIR}"
     echo
 
-    # Step 3 — build EFI binary
-    build_bootia32 "$WORKDIR"
+    # Step 3 — probe the ISO
+    local efi_dir iso_cfg marker
+    efi_dir=$(find_efi_path "$input_iso")
+    info "EFI directory inside ISO: ${efi_dir}"
+    iso_cfg=$(find_grub_cfg "$input_iso")
+    if [[ -n "$iso_cfg" ]]; then
+        info "GRUB config inside ISO: ${iso_cfg}"
+    else
+        iso_cfg="${GRUB_CFG_CANDIDATES[0]}"
+        warn "No GRUB config found in the ISO (looked for: ${GRUB_CFG_CANDIDATES[*]})."
+        warn "bootia32.efi will try ${iso_cfg} but will most likely drop to a GRUB shell."
+    fi
+    marker="/.uefi32-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
     echo
 
-    # Step 4 — patch ISO
-    patch_iso "$input_iso" "$output_iso" "$WORKDIR"
+    # Step 4 — build EFI binary
+    build_bootia32 "$WORKDIR" "$iso_cfg" "$marker"
+    echo
+
+    # Step 5 — patch ISO
+    patch_iso "$input_iso" "$output_iso" "$WORKDIR" "$efi_dir" "$marker"
     echo
 
     echo -e "${BOLD}${GREEN}Done!${NC} You can now write the patched ISO to a USB drive:"
