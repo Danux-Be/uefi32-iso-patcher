@@ -19,7 +19,7 @@ The fix is to add `bootia32.efi` — a 32-bit GRUB EFI binary — alongside the 
 
 1. **Checks / installs** required tools (`grub-mkimage`, `xorriso`, `mtools`)
 2. **Compiles** `bootia32.efi` using `grub-mkimage` with the `i386-efi` target and a wide set of modules
-3. **Injects** the binary into the ISO's `EFI/BOOT/` directory using `xorriso`, preserving all existing boot entries
+3. **Injects** the binary into the ISO's `EFI/BOOT/` directory **and** into the FAT EFI System Partition image embedded in the ISO (growing it if needed), using `xorriso` and `mtools`, preserving all existing boot entries
 4. Outputs a new patched ISO ready to be written to USB
 
 ---
@@ -28,7 +28,7 @@ The fix is to add `bootia32.efi` — a 32-bit GRUB EFI binary — alongside the 
 
 | Tool | Purpose |
 |------|---------|
-| `grub-mkimage` + i386-efi modules | Build the 32-bit EFI binary |
+| `grub-mkimage` (`grub2-mkimage` on Fedora) + i386-efi modules | Build the 32-bit EFI binary |
 | `xorriso` | Read/write the ISO without re-extracting it |
 | `mtools` | Manipulate the FAT EFI System Partition inside the ISO |
 
@@ -110,6 +110,12 @@ By adding `BOOTIA32.EFI`, the tablet's firmware finds a compatible bootloader an
 ### grub-mkimage modules
 
 The script builds `bootia32.efi` with an extensive set of modules embedded (filesystem drivers, video, partition tables, etc.) so that it works without an external module directory — useful since the tablet firmware can only load one EFI binary.
+
+Its embedded config locates the USB drive through a small marker file (`/.uefi32-xxxxxxxx`) added to the ISO, then hands over to the distribution's own `grub.cfg` (`/boot/grub/grub.cfg`, `/EFI/BOOT/grub.cfg` or `/boot/grub2/grub.cfg`), so you get the usual boot menu.
+
+### Why the EFI System Partition is patched too
+
+When a hybrid ISO is written with `dd`, the firmware does not read the ISO 9660 filesystem: it only looks inside the FAT EFI System Partition (the `efi.img` / appended partition referenced by El Torito and the MBR/GPT). The script therefore adds `bootia32.efi` to that image as well. Copying the ISO contents to a FAT32 drive (e.g. Rufus in ISO mode) uses the ISO 9660 copy instead — both work.
 
 ---
 

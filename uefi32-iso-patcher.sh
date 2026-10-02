@@ -231,6 +231,8 @@ build_bootia32() {
     # Locate the ISO by a marker file unique to this patched image, so we never pick up
     # a grub.cfg from another disk (e.g. a Linux already installed on the internal eMMC).
     # Fall back to searching for the config itself if the marker got lost (file-copy tools).
+    # No explicit source: once this script ends, GRUB's normal mode loads $prefix/grub.cfg
+    # by itself (sourcing it here too would show every menu entry twice).
     local grub_cfg="${workdir}/grub-early.cfg"
     cat > "$grub_cfg" <<GRUBCFG
 set root=
@@ -239,7 +241,6 @@ if [ -z "\$root" ]; then
     search --no-floppy --file --set=root $(grub_quote "$iso_cfg")
 fi
 set prefix=(\$root)$(grub_quote "$(dirname "$iso_cfg")")
-source (\$root)$(grub_quote "$iso_cfg")
 GRUBCFG
 
     # Only pass modules that are actually present — the set varies across distros.
@@ -275,6 +276,100 @@ GRUBCFG
     success "bootia32.efi built ($(du -sh "${workdir}/bootia32.efi" | cut -f1))."
 }
 
+# ── Patch the EFI System Partition image ────────────────────────────────────
+# When the ISO is written with dd, the firmware only reads the FAT EFI System
+# Partition (the El Torito EFI image), never the ISO 9660 tree. bootia32.efi
+# must therefore also be added inside that image.
+
+# Locate the El Torito EFI boot image. Prints one of:
+#   tree <path in ISO>                              (e.g. Debian: /boot/grub/efi.img)
+#   appended <partition> <type> <start> <end>       (e.g. Ubuntu; 512-byte blocks)
+# Prints nothing if the ISO has no EFI boot image.
+find_efi_boot_image() {
+    local iso="$1" report e
+    report=$(xorriso -indev "$iso" -report_el_torito as_mkisofs 2>/dev/null || true)
+    e=$(grep -m1 "^-e '" <<<"$report" || true)
+    [[ -n "$e" ]] || return 0
+    e="${e#-e \'}"
+    e="${e%\'}"
+
+    if [[ "$e" =~ ^--interval:appended_partition_([0-9]+)_ ]]; then
+        local part="${BASH_REMATCH[1]}" line
+        line=$(grep -m1 "^-append_partition ${part} " <<<"$report" || true)
+        [[ "$line" =~ ^-append_partition\ [0-9]+\ ([^ ]+)\ --interval:local_fs:([0-9]+)d-([0-9]+)d: ]] || return 0
+        echo "appended ${part} ${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
+    elif [[ "$e" == /* ]]; then
+        echo "tree ${e}"
+    fi
+}
+
+# Extract the EFI boot image described by find_efi_boot_image into <dest>
+extract_efi_boot_image() {
+    local iso="$1" dest="$2" kind="$3"
+    shift 3
+    case "$kind" in
+        tree)
+            xorriso -osirrox on -indev "$iso" -extract "$1" "$dest" >/dev/null 2>&1
+            chmod u+w "$dest"
+            ;;
+        appended)
+            local start="$3" end="$4"
+            dd if="$iso" of="$dest" bs=512 skip="$start" count=$(( end - start + 1 )) status=none
+            ;;
+    esac
+}
+
+# Rebuild a FAT ESP image with bootia32.efi added, growing it as needed.
+# Usage: build_esp <old image> <new image> <bootia32.efi> <workdir>
+build_esp() {
+    local old="$1" new="$2" efi="$3" workdir="$4"
+    local tree="${workdir}/esp-tree"
+
+    mdir -i "$old" ::/ &>/dev/null || return 1
+    rm -rf "$tree" && mkdir -p "$tree"
+    mcopy -s -i "$old" ::/ "$tree/" || return 1
+
+    # Mirror the case of the existing EFI/BOOT directory, if any
+    local boot_dir=""
+    local listing
+    listing=$(mdir -/ -b -i "$old" ::/ 2>/dev/null || true)
+    boot_dir=$(grep -im1 '/bootx64\.efi$' <<<"$listing" || true)
+    if [[ -n "$boot_dir" ]]; then
+        boot_dir="${boot_dir#::}"
+        boot_dir="${boot_dir%/*}"
+    else
+        boot_dir="/EFI/BOOT"
+    fi
+    # Replace an existing bootia32.efi in place
+    local target="${boot_dir}/bootia32.efi"
+    local existing
+    existing=$(grep -im1 '/bootia32\.efi$' <<<"$listing" || true)
+    [[ -n "$existing" ]] && target="${existing#::}"
+    mkdir -p "${tree}$(dirname "$target")"
+    cp "$efi" "${tree}${target}"
+
+    # Size: content + 1 MiB for FAT metadata and slack, in 512-byte sectors
+    local bytes sectors
+    bytes=$(du -sb --apparent-size "$tree" | cut -f1)
+    sectors=$(( (bytes + 1024 * 1024) / 512 ))
+    (( sectors % 2 )) && (( sectors++ ))
+
+    # Keep the original volume label (some loaders search the ESP by label)
+    local label label_args=()
+    label=$(mlabel -s -i "$old" :: 2>/dev/null | sed -n 's/^ *Volume label is //p' || true)
+    [[ -n "$label" ]] && label_args=(-v "$label")
+
+    rm -f "$new"
+    mformat -C -i "$new" -T "$sectors" "${label_args[@]}" :: || return 1
+    local entries=()
+    shopt -s dotglob nullglob
+    entries=("$tree"/*)
+    shopt -u dotglob nullglob
+    mcopy -s -i "$new" "${entries[@]}" ::/ || return 1
+
+    info "EFI System Partition: added ${target} ($(( sectors / 2 )) KiB image)"
+}
+
 # ── Inject bootia32.efi into the ISO ────────────────────────────────────────
 # Usage: patch_iso <input> <output> <workdir> <efi dir in ISO> <marker path in ISO>
 patch_iso() {
@@ -295,6 +390,31 @@ patch_iso() {
 
     echo "uefi32-iso-patcher marker — used by bootia32.efi to find this image" > "${workdir}/marker"
 
+    # Patch the EFI System Partition too (needed for dd-written USB drives)
+    local esp_args=() esp_info
+    esp_info=$(find_efi_boot_image "$input_iso")
+    if [[ -z "$esp_info" ]]; then
+        warn "No El Torito EFI boot image found: only the ISO 9660 tree is patched."
+        warn "A dd-written USB drive may not boot; copy the ISO contents to a FAT32 drive instead."
+    else
+        local kind esp_spec
+        read -r kind esp_spec <<<"$esp_info"
+        info "EFI boot image: ${esp_info}"
+        local -a spec
+        read -ra spec <<<"$esp_spec"
+        if extract_efi_boot_image "$input_iso" "${workdir}/esp-old.img" "$kind" "${spec[@]}" \
+            && build_esp "${workdir}/esp-old.img" "${workdir}/esp-new.img" "${workdir}/bootia32.efi" "$workdir"; then
+            case "$kind" in
+                # Same path in the tree: -boot_image replay re-points El Torito and the
+                # hybrid partition table to the new (bigger) file
+                tree)     esp_args=(-map "${workdir}/esp-new.img" "${spec[0]}") ;;
+                appended) esp_args=(-append_partition "${spec[0]}" "${spec[1]}" "${workdir}/esp-new.img") ;;
+            esac
+        else
+            warn "Could not rebuild the EFI boot image: only the ISO 9660 tree is patched."
+        fi
+    fi
+
     # Never leave a stale output around: it would hide a failed run
     rm -f "$output_iso"
 
@@ -306,6 +426,7 @@ patch_iso() {
         -map    "${workdir}/bootia32.efi" "$target" \
         -map    "${workdir}/marker" "$marker" \
         -boot_image any replay \
+        "${esp_args[@]}" \
         >"$log" 2>&1; then
         grep -v '^xorriso : UPDATE' "$log" >&2 || true
         rm -f "$output_iso"
